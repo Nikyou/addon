@@ -42,7 +42,7 @@ local function convertToCorrectUnit(unit, toDroptimizerKey)
         return charInDB.droptimizerKey
       end
       local name, realm = select(6, GetPlayerInfoByGUID(unit))
-      if not name then return nil end
+      if not name or issecretvalue(name) or (realm and issecretvalue(realm)) then return nil end
       return sformat("%s-%s", name:lower(), (realm == nil or realm == "") and ns.me.realmId or ns.GetRealmId(nil, realm))
     end
     -- split on the first hyphen only: character names cannot contain one, but realm slugs do
@@ -53,7 +53,7 @@ local function convertToCorrectUnit(unit, toDroptimizerKey)
     end
     -- its either unitId or name without realm, so this should work just fine
     name, realm = UnitNameUnmodified(Ambiguate(unit, "none"))
-    if not name then return nil end -- assume its an unitid that we cant currently get data from (or someone supplied a name without realm that cannot be used as unitId)
+    if not name or issecretvalue(name) or (realm and issecretvalue(realm)) then return nil end -- assume its an unitid that we cant currently get data from (or someone supplied a name without realm that cannot be used as unitId)
     return sformat("%s-%s", name:lower(), (realm == nil or realm == "") and ns.me.realmId or ns.GetRealmId(nil, realm))
   end
   if isGuid then return unit end
@@ -201,6 +201,34 @@ function WowUtilsAPI.GetBonusCoinUsage(unit)
   if not char then return nil end
   return CopyTable(char.bonusCoinUsage or {}), 0, char.bonusCoinUsageUpdated or 0
 end
+---Raid lockouts as a mask, one bit per boss per difficulty, a set bit means the boss is still available.
+---Data from before the current weekly reset comes back as everything available. Use DecodeLockouts
+---to read it, the bit layout changes between seasons.
+---@param unit string
+---@return number? lockouts nil when we have never received a scan for this character
+---@return number? refreshed
+---@return number? updated
+function WowUtilsAPI.GetLockouts(unit)
+  if not unit or issecretvalue(unit) then return nil end
+  local char = findChar(unit)
+  if not (char and char.lockouts) then return nil end
+  local refreshed = (char.dataRefreshTimes and char.dataRefreshTimes.lockouts) or 0
+  local updated = char.lockoutsUpdated or 0
+  if updated < C_DateAndTime.GetWeeklyResetStartTime() then
+    return ns.lockouts.fullMask, refreshed, updated
+  end
+  return char.lockouts, refreshed, updated
+end
+
+---Decodes a mask from GetLockouts. Encounters tagged as mythic flex in our config (eg. Nymrissa)
+---are keyed under difficulty 233 instead of 16.
+---@param lockouts number
+---@return table<number, table<number, boolean>>? available dungeonEncounterId = { difficultyId = available }
+function WowUtilsAPI.DecodeLockouts(lockouts)
+  if type(lockouts) ~= "number" or issecretvalue(lockouts) then return nil end
+  return ns.lockouts.Decode(lockouts)
+end
+
 ---Imported droptimizer/sim data. Also accepts a raw droptimizer key ("name-realmId").
 ---Breaking change in db 3: `specs[specId][simId].items[itemId]` is an array of results, not a
 ---single one. A sim can report the same item for more than one slot (rings, trinkets, weapons) or

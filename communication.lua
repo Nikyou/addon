@@ -8,6 +8,12 @@ local tinsert, tconcat, sformat, CompressString, DecompressString, SerializeCBOR
 local prefixes = {
   normal = "wowutilsS",
   updateChecker = "wowutilsDU",
+  lowPrio = "wowutilsLP",
+}
+local msgPrioForPrexies = {
+  [prefixes.normal] = "NORMAL",
+  [prefixes.updateChecker] = "NORMAL",
+  [prefixes.lowPrio] = "BULK",
 }
 local aceComms = LibStub("AceComm-3.0")
 local selfPartialGuids = {
@@ -22,6 +28,7 @@ local private = {}
 ---@field SendCurrencyUpdate fun()
 ---@field SendFullSync fun()
 ---@field AddonMessageRestrictionsLifted fun()
+---@field SendCraftingOrders fun()
 ns.communication = {
   msgHandlers = {}
 }
@@ -36,13 +43,8 @@ ns.communication.msgHandlers[prefixes.normal] = function(prefix, msg, channel, s
   dbVersion = tonumber(dbVersion)
   configVersion = tonumber(configVersion)
   if not (dbVersion and configVersion and idType and id) then
-    geterrorhandler()("Invalid message format: " .. msg)
-    return
-  end
-  dbVersion = tonumber(dbVersion)
-  configVersion = tonumber(configVersion)
-  if not (dbVersion and configVersion) then -- recheck after tonumber call
-    geterrorhandler()("Invalid message format: " .. msg)
+    -- debug only, otherwise anyone in the guild could pop errors for everyone with a broken message
+    ns.Debug.print("Invalid message format from '%s': %s", sender, msg)
     return
   end
   if msgType == ns.enums.addonMessagesTypes.fullCharacterSyncRequest then
@@ -59,7 +61,7 @@ ns.communication.msgHandlers[prefixes.normal] = function(prefix, msg, channel, s
       ns.Debug.print("not for me")
       return
     end
-    -- no point in sending newer data to an older addon, it can't read it. configVersion counts as
+    -- no point in sending newer data to an older addon, it wont read it. configVersion counts as
     -- much as dbVersion now that 5 moved the wire format to zlib: a client on an older config drops
     -- our reply outright, so answering it only burns chat bandwidth.
     if dbVersion < ns.config.currentDBVersion or configVersion < ns.config.configVersion then
@@ -107,11 +109,12 @@ ns.communication.msgHandlers[prefixes.normal] = function(prefix, msg, channel, s
     local dataType = dataStr:sub(1, 1)
     if ns.mapping.toRealData[dataType] then
       ns.mapping.toRealData[dataType](configVersion, dbVersion, dataStr:sub(2), nil, fullGuid, channel, sender)
-    else
-      geterrorhandler()("No handler found for data type: " .. dataType)
+    else -- most likely a data type added in a newer version, don't throw at users who haven't updated yet
+      ns.Debug.print("No handler found for data type: '%s'", dataType)
     end
   end
 end
+ns.communication.msgHandlers[prefixes.lowPrio] = ns.communication.msgHandlers[prefixes.normal] -- just use same handler, functionality is the same (at least for now)
 if ns.hasDataAddon then
   local mapToTimestampVars = {
     [2] = "currencyUpdated",
@@ -120,6 +123,12 @@ if ns.hasDataAddon then
     [5] = "craftingItemsUpdated",
     [6] = "vaultDataLastUpdate",
     [7] = "weeklyRewardsUpdate",
+    -- 8 is used for lastUpdate, dont wanna change that
+    -- 9 is used for droptimizerKey
+    [10] = "dungeonsUpdated",
+  }
+  local minConfigVersionsToCare = {
+    [10] = 6,
   }
   ns.communication.msgHandlers[prefixes.updateChecker] = function(prefix, msg, channel, sender)
     if channel ~= "GUILD" then return end -- only accept messages from guild chat for now
@@ -129,21 +138,22 @@ if ns.hasDataAddon then
     dbVersion = tonumber(dbVersion)
     configVersion = tonumber(configVersion)
     if not (dbVersion and configVersion and guidType and partialGuid) then
-      geterrorhandler()("Invalid message format: " .. msg)
+      ns.Debug.print("Invalid update check format from '%s': %s", sender, msg)
       return
     end
     if dbVersion > ns.config.currentDBVersion or configVersion > ns.config.configVersion then return end -- our version is older, just ignore
     local data = { strsplit("^", dataStr) }
+    if not tonumber(data[1]) then return end
     local fixedPoint = ns.mapping.timestamp.FromValue(data[1])
-    for i = 2, 8 do
-      data[i] = fixedPoint - (tonumber(data[i]) or 0)
+    for k,v in pairs(mapToTimestampVars) do
+      data[k] = fixedPoint - (tonumber(data[k]) or 0)
     end
     -- only answer a sender on our own config: since 5 the payload is zlib wrapped, so an older client
     -- would just drop the droptimizer data. the RequestFullSync calls further down stay unconditional
     -- though, those still pay off: the request rides in the uncompressed header so an older client
     -- reads it fine and answers in deflate, which prepString falls back to.
     if data[9] and WowUtilsDB.droptimizerData[data[9]] and configVersion >= ns.config.configVersion then -- droptimizerKey
-      if WowUtilsDB.droptimizerData[data[9]].lastUpdate > data[8] then
+      if WowUtilsDB.droptimizerData[data[9]].lastUpdate > fixedPoint - (tonumber(data[8]) or 0) then
         ns.communication.SendDroptimizerData(data[9])
       end
     end
@@ -155,8 +165,10 @@ if ns.hasDataAddon then
     -- check if any of the data types is older, if its just request full sync since there is some data that we are missing, highly likely that we are missing more than just a single data point
     for k, v in pairs(mapToTimestampVars) do
       if (not data[k]) or data[k] > (WowUtilsDB.others[targetGuid][v] or 0) then
-        ns.communication.RequestFullSync(partialGuid, channel)
-        return
+        if (not minConfigVersionsToCare[k]) or (minConfigVersionsToCare[k] <= configVersion) then
+          ns.communication.RequestFullSync(partialGuid, channel)
+          return
+        end
       end
     end
   end
@@ -168,6 +180,7 @@ private.groupChannels = {
   --[ns.enums.chatChannels.raid] = true,
 }
 function private.confimChannel(prefChannel)
+  prefChannel = prefChannel:lower()
   if prefChannel == ns.enums.chatChannels.guild then
     return IsInGuild() and prefChannel or nil
   end
@@ -204,12 +217,12 @@ function private.whitelistDataUpdateCheck()
       for guid, charData in pairs(WowUtilsDB.others) do -- TODO build slug to guid list somewhere thats kept up to date when new data is getting in (in theory slug can have multiple guids which makes it awkward)
         if charData.droptimizerKey and slugToId[charData.droptimizerKey] then
           found[slugToId[charData.droptimizerKey]] = true
-          table.insert(temp, {id = slugToId[charData.droptimizerKey], timestamp = ns.mapping.GetCharacterTimestampsForWideSync(charData)})
+          table.insert(temp, {id = slugToId[charData.droptimizerKey], timestamp = ns.mapping.GetCharacterTimestampsForWideSync(charData), itemTimestamp = ns.mapping.timestamp.ToValue(charData.itemCacheUpdated or 0)})
         end
       end
       for k,v in pairs(slugToId) do
         if not found[v] and not ns.database.ownSlugs[k] then
-          table.insert(temp, {id = v, timestamp = 0})
+          table.insert(temp, {id = v, timestamp = 0, itemTimestamp = 0})
         end
       end
       local str = ns.mapping.GetMsgData(ns.enums.context.whitelistCharSyncRequest, temp, nil, listId)
@@ -228,6 +241,11 @@ end)
 
 function private.generalUpdateCheck()
   if ns.restrictedAddonMessages then return end -- unlike private.updateCheck, this actually takes resources to run, so skip checks during restrictions
+  -- runs every couple of minutes anyway, keeps the cache from holding on to expired orders between syncs
+  local guildCache = ns.randomThings.craftingOrders.GetGuildCache()
+  if guildCache then
+    ns.randomThings.craftingOrders.PruneExpired(guildCache)
+  end
   local str = ns.mapping.GetMsgData(ns.enums.context.generalUpdatedCheck)
   if str == "" then return end
   ns.Debug.print("sending generalUpdateCheck")
@@ -244,6 +262,9 @@ end)
 function private.getCorrectPrefixForType(addonMessagesType)
   if addonMessagesType == ns.enums.addonMessagesTypes.updateCheckForDesktopAppUsers then
     return prefixes.updateChecker
+  end
+  if addonMessagesType == ns.enums.addonMessagesTypes.itemCache or addonMessagesType == ns.enums.addonMessagesTypes.craftingOrders then
+    return prefixes.lowPrio
   end
   return prefixes.normal
 end
@@ -313,7 +334,7 @@ end
 ---@param addonMessagesType wowutils_enums_addonMessageTypes
 ---@param uncompressedMsg string
 ---@param prefChannel "instance_chat"|"raid"|"party"|"guild"
----@param prio "BULK"|"NORMAL"|"ALERT"
+---@param prio "BULK"|"NORMAL"|"ALERT" this is not actually in use anymore, instead its hardcoded prio per prefix (but cba to refactor atm)
 ---@param target string? if nil, assume source guid instead
 ---@param isCbor boolean
 function private.sendAddonMessage(addonMessagesType, uncompressedMsg, prefChannel, prio, target, isCbor)
@@ -339,10 +360,10 @@ function private.sendAddonMessage(addonMessagesType, uncompressedMsg, prefChanne
   local prefix = private.getCorrectPrefixForType(addonMessagesType)
   if not prefix then return end
   if prefix == prefixes.updateChecker then
-    aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(addonMessagesType, uncompressedMsg, target, isCbor), prefChannel, nil, prio)
+    aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(addonMessagesType, uncompressedMsg, target, isCbor), prefChannel, nil, msgPrioForPrexies[prefix])
     return
   end
-  aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(addonMessagesType, private.prepString(uncompressedMsg, true), target, isCbor), prefChannel, nil, prio)
+  aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(addonMessagesType, private.prepString(uncompressedMsg, true), target, isCbor), prefChannel, nil, msgPrioForPrexies[prefix])
 end
 
 function ns.communication.AddonMessageRestrictionsLifted()
@@ -352,9 +373,9 @@ function ns.communication.AddonMessageRestrictionsLifted()
     local channel = private.confimChannel(data.prefChannel)
     if prefix and channel then
       if prefix == prefixes.updateChecker then
-        aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(data.addonMessageType, data.uncompressedMsg, data.target, data.isCbor), channel, nil, data.prio)
+        aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(data.addonMessageType, data.uncompressedMsg, data.target, data.isCbor), channel, nil, msgPrioForPrexies[prefix])
       else
-        aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(data.addonMessageType, private.prepString(data.uncompressedMsg, true), data.target, data.isCbor), channel, nil, data.prio)
+        aceComms:SendCommMessage(prefix, private.addVersionsToCompressedString(data.addonMessageType, private.prepString(data.uncompressedMsg, true), data.target, data.isCbor), channel, nil, msgPrioForPrexies[prefix])
       end
     end
   end
@@ -451,6 +472,26 @@ do
 end
 do
   local lastSentTime = 0
+  function ns.communication.SendLockoutUpdate()
+    if GetTime() - lastSentTime < 1 then return end
+    if not charDB.lockouts then return end
+    ns.Debug.print("sending lockout update")
+    private.sendAddonMessage(ns.enums.addonMessagesTypes.partialCharacterUpdate, ns.mapping.GetMsgData(ns.enums.context.lockouts, charDB.lockouts, charDB.lockoutsUpdated), ns.enums.chatChannels.guild, "NORMAL", nil, false)
+    lastSentTime = GetTime()
+  end
+end
+do
+  local lastSentTime = 0
+  function ns.communication.SendDungeonsDoneUpdate()
+    if GetTime() - lastSentTime < 1 then return end
+    if not charDB.dungeonsDone then return end
+    ns.Debug.print("sending dungeonsDone update")
+    private.sendAddonMessage(ns.enums.addonMessagesTypes.partialCharacterUpdate, ns.mapping.GetMsgData(ns.enums.context.dungeonsDone, charDB.dungeonsDone, charDB.dungeonsUpdated), ns.enums.chatChannels.guild, "NORMAL", nil, false)
+    lastSentTime = GetTime()
+  end
+end
+do
+  local lastSentTime = 0
   ---@param targetChannel string
   function ns.communication.SendFullSyncFromCurrentCharacter(targetChannel)
     if GetTime() - lastSentTime < 5 then return end
@@ -466,6 +507,29 @@ do
     if GetTime() - (cache[data.guid] or 0) < 5 then return end
     ns.Debug.print("sending full char '%s'", data.droptimizerKey)
     private.sendAddonMessage(ns.enums.addonMessagesTypes.fullCharacterSync, ns.mapping.GetMsgData(ns.enums.context.fullCharacterSyncFromDB, data), ns.enums.chatChannels.guild, "NORMAL", "A"..ns.mapping.ConvertGuidToMsgFormat(data.guid), true)
+    cache[data.guid] = GetTime()
+  end
+end
+do
+  local cache = {}
+  local delayedSends = {}
+  ---@param data wowutils_ownChar|wowutils_otherChar
+  function ns.communication.SendItemsFromSpecificCharacter(data)
+    local sinceLast = GetTime() - (cache[data.guid] or 0)
+    if sinceLast < 5 then
+      -- don't drop it, a change right after a send would otherwise never go out. data is the live db
+      -- table, so the delayed send picks up whatever changed in the meantime
+      if not delayedSends[data.guid] then
+        delayedSends[data.guid] = C_Timer.NewTimer(5 - sinceLast, function()
+          delayedSends[data.guid] = nil
+          ns.communication.SendItemsFromSpecificCharacter(data)
+        end)
+      end
+      return
+    end
+    ns.Debug.print("sending items for char '%s'", data.droptimizerKey)
+    if not data.itemCache then return end
+    private.sendAddonMessage(ns.enums.addonMessagesTypes.itemCache, ns.mapping.GetMsgData(ns.enums.context.itemCache, data), ns.enums.chatChannels.guild, "NORMAL", "A"..ns.mapping.ConvertGuidToMsgFormat(data.guid), true)
     cache[data.guid] = GetTime()
   end
 end
@@ -531,31 +595,30 @@ do
     cache[key] = GetTime()
   end
 end
-function ns.communication.SendFullDBSync()
-  if true then return end
-  local allChars = {}
-  for k, v in pairs(allCharsDB) do
-    if v.region == ns.region then
-      local char = {}
-      ---@type wowutils_characterInformationForMapping
-      local _mappingInfoForChar = {
-        class = v.class,
-        guid = v.guid,
-        lastUpdate = v.lastUpdate,
-        lastUpdateReceived = v.lastUpdateReceived,
-        name = v.name,
-        region = v.region,
-      }
-      tinsert(char, ns.mapping.GetMsgData(ns.enums.context.characterInformation, _mappingInfoForChar))
-      tinsert(char, ns.mapping.GetMsgData(ns.enums.context.currency, v.currency, v.currencyUpdated))
-      tinsert(char, ns.mapping.GetMsgData(ns.enums.context.craftingItems, v.craftingItems, v.craftingItemsUpdated))
-      tinsert(char, ns.mapping.GetMsgData(ns.enums.context.watermarks, v.watermarks, v.watermarksUpdated))
-      tinsert(allChars, tconcat(char, ";"))
+do
+  local lastSentTime = 0
+  local delayedSend
+  ---sends every profession of the current guild in one message
+  function ns.communication.SendCraftingOrders()
+    local sinceLast = GetTime() - lastSentTime
+    if sinceLast < 10 then
+      -- don't drop it, merges rely on the send back to converge
+      if not delayedSend then
+        delayedSend = C_Timer.NewTimer(10 - sinceLast, function()
+          delayedSend = nil
+          ns.communication.SendCraftingOrders()
+        end)
+      end
+      return
     end
+    if not IsInGuild() then return end
+    local guildCache = ns.randomThings.craftingOrders.GetGuildCache()
+    if not (guildCache and next(guildCache)) then return end
+    ns.randomThings.craftingOrders.PruneExpired(guildCache)
+    ns.Debug.print("sending crafting orders")
+    private.sendAddonMessage(ns.enums.addonMessagesTypes.craftingOrders, ns.mapping.GetMsgData(ns.enums.context.craftingOrders, guildCache, nil, ns.me.guildInfo.dbSlug), ns.enums.chatChannels.guild, "BULK", nil, true)
+    lastSentTime = GetTime()
   end
-  local str = tconcat(allChars, "@")
-  local compressed = CompressString(str, Enum.CompressionMethod.Deflate, Enum.CompressionLevel.OptimizeForSize)
-  ns.Debug.print("Compressed length: %s - FullStr: %s", compressed:len(), str:len())
 end
 
 function ns.communication.guildStatusUpdate()

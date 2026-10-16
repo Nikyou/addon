@@ -58,6 +58,16 @@ ns.tooltip = {}
 ---@field current number
 ---@field earned number
 
+---@class wowutils_tooltip_bonusCoinUse
+---@field difficulty string? only set when the viewed item has no difficulty of its own to match against
+---@field receiveTime number
+---@field itemLink string? what the roll gave
+---@field icon number the given item's icon, or the coin's when the roll gave no item
+
+---@class wowutils_tooltip_bonusCoin
+---@field encounterName string
+---@field coins wowutils_tooltip_bonusCoinUse[] empty when the boss hasn't been coined
+
 ---@class wowutils_tooltip_model
 ---@field item wowutils_tooltip_item
 ---@field candidate wowutils_tooltip_candidate
@@ -70,6 +80,8 @@ ns.tooltip = {}
 ---@field crestsUpdated number?
 ---@field watermarks {label: string, value: number}[]?
 ---@field watermarksUpdated number?
+---@field bonusCoin wowutils_tooltip_bonusCoin? nil when the item's boss isn't known
+---@field bonusCoinUpdated number?
 ---@field noPlayerData boolean
 
 local MEDIA_PATH = sformat([[Interface\AddOns\%s\media\]], addon_name)
@@ -325,7 +337,7 @@ local sourceIconCache = {}
 local function sourceItemIcon(itemId)
   local cached = sourceIconCache[itemId]
   if cached then return cached end
-  local icon = select(5, GetItemInfoInstant(itemId))
+  local icon = select(5, C_Item.GetItemInfoInstant(itemId))
   -- not in the client's cache yet. return nothing rather than caching the fallback icon forever,
   -- the next draw picks it up
   if not icon then return "" end
@@ -360,7 +372,7 @@ local function itemNameWithSource(itemId, catalyst, sourceItemId)
   return sformat("%s %s", marker, itemNameOf(itemId))
 end
 local function itemIconOf(itemId)
-  return select(5, GetItemInfoInstant(itemId)) or 134400
+  return select(5, C_Item.GetItemInfoInstant(itemId)) or 134400
 end
 local function qualityColor(itemId)
   local q = C_Item.GetItemQualityByID(itemId)
@@ -497,6 +509,31 @@ local function otherOptions(m, y)
 end
 
 ---@param m wowutils_tooltip_model
+local function bonusCoin(m, y)
+  local bc = m.bonusCoin
+  if not bc then return y end
+  y = eyebrow(y, "coins", sformat("Bonus roll  ·  %s", bc.encounterName), age(m.bonusCoinUpdated))
+  if #bc.coins == 0 then
+    text(FONTS.small, "Not coined yet", rgb(COLORS.muted)):SetPoint("TOPLEFT", card, "TOPLEFT", PAD, y - 2)
+    return y - ROW - GAP
+  end
+  for _, c in ipairs(bc.coins) do
+    plate(PAD, y - 1, ICON, c.icon, COLORS.border)
+    local label = "Coined"
+    if c.difficulty then label = sformat("%s  ·  %s", label, c.difficulty) end
+    if c.itemLink then label = sformat("%s  ·  %s", label, c.itemLink) end
+    local fs = text(FONTS.body, label, rgb(COLORS.fg))
+    fs:SetPoint("TOPLEFT", card, "TOPLEFT", PAD + ICON + 6, y - 2)
+    fs:SetWidth(W - PAD * 2 - ICON - 6 - AGE_W - COL_GAP)
+    local ageFs = text(FONTS.monoSmall, age(c.receiveTime), rgb(COLORS.dim))
+    ageFs:SetJustifyH("RIGHT")
+    ageFs:SetPoint("TOPRIGHT", card, "TOPRIGHT", -PAD, y - 3)
+    y = y - ROW
+  end
+  return y - GAP
+end
+
+---@param m wowutils_tooltip_model
 local function crests(m, y)
   if m.noPlayerData then
     y = eyebrow(y, "coins", "Crests")
@@ -541,6 +578,7 @@ function ns.tooltip.Show(owner, m)
   y = wishlist(m, y)
   y = droptimizer(m, y)
   y = otherOptions(m, y)
+  y = bonusCoin(m, y)
   y = crests(m, y)
   card:SetHeight(-y + PAD - GAP)
   ns.tooltip.PlaceAtCursor()

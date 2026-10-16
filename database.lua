@@ -19,9 +19,48 @@ local GetServerTime, sformat = GetServerTime, string.format
 ---@field syncLists table<string, wowutilsSyncList>
 ---@field configVersion number
 ---@field options wowutils_options
+---@field craftingOrderCache table<string, table<number, wowutils_craftingOrderProfession>> guild dbSlug -> Enum.Profession -> data
+
+---@class wowutils_craftingOrderProfession
+---@field lastScan number last time someone with the profession scanned guild orders
+---@field lastUpdate number lastScan or last customer side edit, whichever is newer, used for syncing
+---@field orders table<number, wowutils_craftingOrder> orderId -> order
+
+---@class wowutils_craftingOrder
+---@field customerGuid string short guid, without the "Player-" prefix
+---@field expirationTime number
+---@field itemId number
+---@field isRecraft true? nil instead of false to keep transfers small
+---@field isDone true? nil instead of false to keep transfers small
+---@field updated number? only set on entries from a customer side scan, kept on merge while newer than lastScan
+---@field tip number? gold, floored, nil when under 1g
+---@field seen number? first seen, as whole minutes before expirationTime (smaller on the wire than a timestamp). nil for entries from before it was tracked
 
 ---@class wowutils_options
 ---@field characterFilters wowutils_options_characterFilters
+---@field warboundOptions wowutils_options_warboundOptions
+---@field notifications wowutils_options_notifications
+---@field craftingOrders wowutils_options_craftingOrders
+
+---@class wowutils_options_craftingOrders
+---@field tipThreshold number minimum tip in gold for a notification
+---@field printToChat boolean also print notifications to chat
+---@field professions table<number, boolean> Enum.Profession -> notify for it
+
+---@class wowutils_options_notifications
+---@field x number offset from UIParent center
+---@field y number offset from UIParent center
+---@field font string LibSharedMedia font name
+---@field fontSize number
+---@field spacing number extra space between lines
+---@field color {r:number, g:number, b:number} used when a message doesn't pass its own color
+---@field justify "LEFT"|"CENTER"|"RIGHT"
+---@field timeVisible number seconds before a message starts fading
+---@field fadeDuration number
+
+---@class wowutils_options_warboundOptions
+---@field enabled boolean show warbound until equipped drops from loot messages
+---@field selfOnly boolean only show own drops
 
 ---@class wowutils_options_characterFilters
 ---@field hideUntracked boolean? hide characters no synclist tracks
@@ -81,6 +120,12 @@ local GetServerTime, sformat = GetServerTime, string.format
 ---@field bonusCoinScannedHistory table<number, wowutils_bonuscoinMissingItems[]> -- specID = missingItems[]
 ---@field bonusCoinScannedHistoryUpdated number
 ---@field addonVersion string
+---@field itemCache table<wowutils_enums_itemCacheType, table<string, wowutils_itemcache>> -- string = itemGuid
+---@field itemCacheUpdated number
+---@field lockouts number? raid lockout mask, layout from ns.config.lockouts, a set bit means the boss is still available. nil = never scanned
+---@field lockoutsUpdated number
+---@field dungeonsDone table<number, number> -- keyLevel = keysDone
+---@field dungeonsUpdated number
 
 ---@class wowutils_bonuscoinMissingItems
 ---@field itemId number
@@ -158,6 +203,31 @@ local GetServerTime, sformat = GetServerTime, string.format
 ---@field itemId number
 ---@field note? string
 
+---@class wowutils_itemcache
+---@field equipped number?
+---@field itemLink string
+---@field warbound boolean?
+
+---@type wowutils_options_notifications
+local notificationDefaults = {
+  x = 0,
+  y = 150,
+  font = "IBM Plex Sans SemiBold", -- registered to LSM in notifications.lua
+  fontSize = 18,
+  spacing = 0,
+  color = { r = 1, g = 1, b = 1 },
+  justify = "CENTER",
+  timeVisible = 3,
+  fadeDuration = 0.5,
+}
+
+---@type wowutils_options_craftingOrders
+local craftingOrderDefaults = {
+  tipThreshold = 10,
+  printToChat = true,
+  professions = {}, -- everything off by default, same as the liquid addon
+}
+
 ---@type wowutilsSavedVariables
 WowUtilsDB = WowUtilsDB or {
   dbVersion = ns.config.currentDBVersion,
@@ -169,6 +239,9 @@ WowUtilsDB = WowUtilsDB or {
   syncLists = {},
   options = {
     characterFilters = {},
+    warboundOptions = { enabled = false, selfOnly = false },
+    notifications = CopyTable(notificationDefaults),
+    craftingOrders = CopyTable(craftingOrderDefaults),
   },
 }
 
@@ -198,6 +271,7 @@ if not WowUtilsDB.ownCharacters[ns.me.guid] then
     vaultDataLastUpdate = 0,
     lastWeeklyReset = C_DateAndTime.GetWeeklyResetStartTime(),
     questsUpdated = 0,
+    lockoutsUpdated = 0, -- lockouts itself stays nil until the first scan, 0 would read as everything killed
   }
 else
   WowUtilsDB.ownCharacters[ns.me.guid].name = ns.me.name
@@ -210,14 +284,53 @@ if not WowUtilsDB.syncLists then
   WowUtilsDB.syncLists = {}
 end
 if not WowUtilsDB.options then -- added on 1.0.4, existing installs have no table yet
-  WowUtilsDB.options = { characterFilters = {} }
+  WowUtilsDB.options = { characterFilters = {}, warboundOptions = { enabled = false, selfOnly = false }, notifications = CopyTable(notificationDefaults), craftingOrders = CopyTable(craftingOrderDefaults) }
 end
 if not WowUtilsDB.options.characterFilters then
   WowUtilsDB.options.characterFilters = {}
 end
+if not WowUtilsDB.options.warboundOptions then
+  WowUtilsDB.options.warboundOptions = { enabled = false, selfOnly = false }
+end
+if not WowUtilsDB.options.notifications then
+  WowUtilsDB.options.notifications = CopyTable(notificationDefaults)
+end
+-- fill per key, so options added later on get their default without resetting the rest
+for k, v in pairs(notificationDefaults) do
+  if WowUtilsDB.options.notifications[k] == nil then
+    WowUtilsDB.options.notifications[k] = type(v) == "table" and CopyTable(v) or v
+  end
+end
+if not WowUtilsDB.options.craftingOrders then -- added on 1.0.8
+  WowUtilsDB.options.craftingOrders = CopyTable(craftingOrderDefaults)
+end
+for k, v in pairs(craftingOrderDefaults) do
+  if WowUtilsDB.options.craftingOrders[k] == nil then
+    WowUtilsDB.options.craftingOrders[k] = type(v) == "table" and CopyTable(v) or v
+  end
+end
 if not WowUtilsDB.droptimizerData then -- the cleanup sweep below walks this on every client now
   WowUtilsDB.droptimizerData = {}
 end
+if not WowUtilsDB.craftingOrderCache then -- added on 1.0.8
+  WowUtilsDB.craftingOrderCache = {}
+end
+-- early 1.0.8 builds kept orders as an array with orderId inside each entry, rekey those by orderId
+--[=[
+for _, guildCache in pairs(WowUtilsDB.craftingOrderCache) do
+  for _, professionData in pairs(guildCache) do
+    local orders = professionData.orders --[[@as table]]
+    if type(orders) == "table" and orders[1] and orders[1].orderId then
+      local keyed = {}
+      for _, order in ipairs(orders) do
+        keyed[order.orderId] = order
+        order.orderId = nil
+      end
+      professionData.orders = keyed
+    end
+  end
+end
+--]=]
 ---@type wowutils_ownChar
 local charDB = WowUtilsDB.ownCharacters[ns.me.guid]
 local db = WowUtilsDB
@@ -264,6 +377,30 @@ charDB.addonVersion = C_AddOns.GetAddOnMetadata(addon_name, "Version")
 ns.database = {}
 ns.database.NormalizeDroptimizerRecord = normalizeDroptimizerRecord
 ns.database.ownSlugs = {}
+do
+  local timestampFields = {
+    "lastUpdate", "currencyUpdated", "watermarksUpdated", "craftingItemsUpdated", "questsUpdated", "vaultDataLastUpdate",
+    "weeklyRewardsUpdate", "bonusCoinUsageUpdated", "lockoutsUpdated", "dungeonsUpdated",
+  }
+  local tableFields = { "currency", "watermarks", "quests", "vaultData", "weeklyRewards", "bonusCoinUsage", "dungeonsDone" }
+  ---fills in what older versions (or a broken sender) left out or got wrong, so readers don't have to check every field
+  ---@param char table
+  function ns.database.NormalizeCharRecord(char)
+    for _, key in ipairs(timestampFields) do
+      if type(char[key]) ~= "number" then char[key] = 0 end
+    end
+    for _, key in ipairs(tableFields) do
+      if type(char[key]) ~= "table" then char[key] = {} end
+    end
+    if type(char.craftingItems) ~= "number" then char.craftingItems = 0 end
+    -- these two mean something when nil (never scanned / never refreshed), so only drop wrong types
+    if char.lockouts ~= nil and type(char.lockouts) ~= "number" then char.lockouts = nil end
+    if char.dataRefreshTimes ~= nil and type(char.dataRefreshTimes) ~= "table" then char.dataRefreshTimes = nil end
+  end
+end
+for _, char in pairs(WowUtilsDB.others) do
+  ns.database.NormalizeCharRecord(char)
+end
 local clearOldConfigData = (db.configVersion or 0) < ns.config.configVersion
 local resetCraftingItems = (db.configVersion or 0) < 4
 if clearOldConfigData then
@@ -303,6 +440,7 @@ for k,v in pairs(WowUtilsDB.ownCharacters) do
   end
 end
 db.configVersion = ns.config.configVersion
+local cacheTimers = {}
 local function contextUpdated(context)
   local serverTime = GetServerTime()
   if context == ns.enums.context.currency then
@@ -326,6 +464,18 @@ local function contextUpdated(context)
   elseif context == ns.enums.context.bonusCoin then
     charDB.bonusCoinUsageUpdated = serverTime
     ns.communication.SendBonusCoinUsageUpdate()
+  elseif context == ns.enums.context.lockouts then
+    charDB.lockoutsUpdated = serverTime
+    ns.communication.SendLockoutUpdate()
+  elseif context == ns.enums.context.itemCache then
+    charDB.itemCacheUpdated = serverTime
+    if cacheTimers.itemCache then cacheTimers.itemCache:Cancel() end
+    cacheTimers.itemCache = C_Timer.NewTimer(3, function()
+      ns.communication.SendItemsFromSpecificCharacter(charDB)
+    end)
+  elseif context == ns.enums.context.dungeonsDone then
+    charDB.dungeonsUpdated = serverTime
+    ns.communication.SendDungeonsDoneUpdate()
   end
   charDB.lastUpdate = serverTime
 end
@@ -352,6 +502,12 @@ function ns.database.DataRefreshed(context, targetDB)
     _type = "quests"
   elseif context == ns.enums.context.bonusCoin then
     _type ="bonusCoinUsage"
+  elseif context == ns.enums.context.lockouts then
+    _type = "lockouts"
+  elseif context == ns.enums.context.itemCache then
+    _type ="itemCache"
+  elseif context == ns.enums.context.dungeonsDone then
+    _type = "dungeonsDone"
   end
   if not _type then return end
   if not targetDB.dataRefreshTimes then
@@ -484,6 +640,7 @@ function ns.database.SaveToCurrentCharacterDB(context, id, data)
     end
     return
   end
+
   if context == ns.enums.context.bonusCoin then
     ---@cast data wowutils_bonusCoinUsage
     if not charDB.bonusCoinUsage then
@@ -491,6 +648,72 @@ function ns.database.SaveToCurrentCharacterDB(context, id, data)
     end
     tinsert(charDB.bonusCoinUsage, data)
     contextUpdated(context)
+    return
+  end
+
+  if context == ns.enums.context.lockouts then
+    ---@cast data number
+    if charDB.lockouts == data then return end
+    charDB.lockouts = data
+    contextUpdated(context)
+    return
+  end
+
+  if context == ns.enums.context.itemCache then
+    ---@cast data wowutils_itemcache
+    ---@cast id wowutils_enums_itemCacheType
+    -- data is also used as cache in the source functions, so we need to copy it to SV instead of using as is
+    if not charDB.itemCache then
+      charDB.itemCache = {[id] = CopyTable(data)}
+      contextUpdated(context)
+      return
+    end
+    if not charDB.itemCache[id] then
+      charDB.itemCache[id] = CopyTable(data)
+      contextUpdated(context)
+      return
+    end
+    local changed = false
+    -- check if some of the old items is missing from new data first
+    for ig, v in pairs(charDB.itemCache[id]) do
+      if not data[ig] then
+        changed = true
+        break
+      end
+    end
+    -- check if there are new items, or one of the old items was changed
+    if not changed then
+      for ig,v in pairs(data) do
+        if not charDB.itemCache[id][ig] then
+          changed = true
+          break
+        end
+        if charDB.itemCache[id][ig].equipped ~= v.equipped or charDB.itemCache[id][ig].itemLink ~= v.itemLink then
+          changed = true
+          break
+        end
+      end
+    end
+    if not changed then return end
+    charDB.itemCache[id] = CopyTable(data)
+    contextUpdated(context)
+    return
+  end
+
+  if context == ns.enums.context.dungeonsDone then
+    ---@cast data table<number, number>
+    if not charDB.dungeonsDone then
+      charDB.dungeonsDone = data
+      contextUpdated(context)
+      return
+    end
+    for k,v in pairs(data) do
+      if charDB.dungeonsDone[k] ~= v then
+        charDB.dungeonsDone = data
+        contextUpdated(context)
+        return
+      end
+    end
     return
   end
   geterrorhandler()("Unknown context: " .. tostring(context))
@@ -511,7 +734,7 @@ function ns.database.CheckEligibleSyncLists()
       if ns.currentGuildSlugs[v] then
         counter = counter + 1
       end
-      if counter >= 5 then -- require at least 5 members of the SyncList to be in the guild before syncing
+      if counter >= 5 then
         ns.eligibleSyncLists[listId] = true
         ns.Debug.print("Setting '%s' to eligible list", listId)
         break
@@ -534,6 +757,10 @@ function ns.database.ResetWeeklyData(currentResetStart)
       for k,v in pairs(toDelete) do
         charData.quests[k] = nil
       end
+    end
+    -- unknown stays unknown. timestamp is left alone, others treat anything older than the reset as all available anyway
+    if charData.lockouts then
+      charData.lockouts = ns.lockouts.fullMask
     end
   end
 end

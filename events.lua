@@ -3,12 +3,15 @@
 ---@field restrictedAddonMessages boolean
 ---@field InLoadingScreen boolean
 ---@field currentGuildSlugs table<string, boolean>
+---@field DealAfterLoadingScreen fun(id:string, func:fun(...), args:any[]?)
 
 ---@type string, wowutilsPrivate
 local addon_name, ns = ...
 ns.restrictedAddonMessages = false
 ns.InLoadingScreen = true
 ---@class wowutils_events : table
+---@field RegisterEvent fun(event:string, ...:string?)
+---@field UnregisterEvent fun(event:string)
 ns.events = {
   eventFrame = CreateFrame("frame")
 }
@@ -17,6 +20,39 @@ local private = {}
 ns.events.eventFrame:SetScript("OnEvent", function(self, event, ...)
   ns.events[event](...)
 end)
+
+do
+  local temp = {}
+  function private.dealAfterLoadingScreen()
+    for id,d in pairs(temp) do
+      d.func(unpack(d.args))
+    end
+    wipe(temp)
+  end
+  function ns.DealAfterLoadingScreen(id, func, args)
+    temp[id] = {func = func, args = args or {}}
+  end
+end
+
+-- addon wide event toggling (eg. based on option toggles), handler still lives in ns.events[event]
+---@param event string
+---@param ... string? units, if given the event is registered as an unit event
+function ns.events.RegisterEvent(event, ...)
+  if not ns.events[event] then
+    geterrorhandler()("No handler found for event: " .. tostring(event))
+    return
+  end
+  if ... then
+    ns.events.eventFrame:RegisterUnitEvent(event, ...)
+  else
+    ns.events.eventFrame:RegisterEvent(event)
+  end
+end
+
+---@param event string
+function ns.events.UnregisterEvent(event)
+  ns.events.eventFrame:UnregisterEvent(event)
+end
 
 ns.events.eventFrame:RegisterEvent("CURRENCY_DISPLAY_UPDATE")
 function ns.events.CURRENCY_DISPLAY_UPDATE(...)
@@ -33,11 +69,9 @@ function ns.events.SPELL_CONFIRMATION_PROMPT(...)
 end
 ns.events.eventFrame:RegisterEvent("PLAYER_LOGIN")
 function ns.events.PLAYER_LOGIN(...)
-  ns.items.CacheWatermarks()
   for currencyId, mapId in pairs(ns.config.currencies) do
     ns.currency.CacheCurrency(currencyId)
   end
-  C_Timer.After(10, ns.items.CacheCraftingItems)
   ns.me.serverSlug = GetNormalizedRealmName()
   ns.events.PLAYER_GUILD_UPDATE("player")
   private.checkForWeeklyReset()
@@ -45,23 +79,57 @@ function ns.events.PLAYER_LOGIN(...)
     C_AddOns.LoadAddOn("Blizzard_WeeklyRewards")
   end
   ns.database.SaveToCurrentCharacterDB(ns.enums.context.serverSlugUpdate, nil, ns.me.serverSlug)
+  ns.randomThings.craftingOrders.PruneAllExpired() -- whatever expired while we were offline
+  C_Timer.After(10, ns.items.InitialCaching)
+  C_Timer.After(5, ns.items.StartEncounterLootScan)
+  RequestRaidInfo() -- lockouts get scanned from the UPDATE_INSTANCE_INFO this fires
 end
 
 ns.events.eventFrame:RegisterEvent("BAG_UPDATE_DELAYED")
 function ns.events.BAG_UPDATE_DELAYED(...)
-  ns.items.CacheCraftingItems()
+  ns.items.BAG_UPDATE_DELAYED(...)
 end
 
 ns.events.eventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 function ns.events.PLAYER_EQUIPMENT_CHANGED(...)
-  ns.items.CacheWatermarks()
+  ns.items.PLAYER_EQUIPMENT_CHANGED(...)
 end
 
 ns.events.eventFrame:RegisterEvent("QUEST_LOG_UPDATE")
 function ns.events.QUEST_LOG_UPDATE(...)
   ns.CheckQuests(...)
 end
+if WowUtilsDB.options.warboundOptions.enabled then -- toggled from gui
+  ns.events.eventFrame:RegisterEvent("CHAT_MSG_LOOT")
+end
+function ns.events.CHAT_MSG_LOOT(...)
+  ns.items.CHAT_MSG_LOOT(...)
+end
 
+ns.events.eventFrame:RegisterEvent("CRAFTINGORDERS_ORDER_PLACEMENT_RESPONSE")
+function ns.events.CRAFTINGORDERS_ORDER_PLACEMENT_RESPONSE(...)
+  ns.randomThings.craftingOrders.CRAFTINGORDERS_ORDER_PLACEMENT_RESPONSE(...)
+end
+
+--[[
+ns.events.eventFrame:RegisterEvent("CRAFTINGORDERS_CAN_REQUEST")
+function ns.events.CRAFTINGORDERS_CAN_REQUEST(...)
+  ns.randomThings.craftingOrders.CRAFTINGORDERS_CAN_REQUEST(...)
+end
+--]]
+ns.events.eventFrame:RegisterEvent("CRAFTINGORDERS_UPDATE_ORDER_COUNT")
+function ns.events.CRAFTINGORDERS_UPDATE_ORDER_COUNT(...)
+  ns.randomThings.craftingOrders.CRAFTINGORDERS_UPDATE_ORDER_COUNT(...)
+end
+ns.events.eventFrame:RegisterEvent("CRAFTINGORDERS_SHOW_CUSTOMER")
+function ns.events.CRAFTINGORDERS_SHOW_CUSTOMER(...)
+  ns.randomThings.craftingOrders.CRAFTINGORDERS_SHOW_CUSTOMER(...)
+end
+ns.events.eventFrame:RegisterEvent("CRAFTINGORDERS_ORDER_CANCEL_RESPONSE")
+function ns.events.CRAFTINGORDERS_ORDER_CANCEL_RESPONSE(...)
+  ns.randomThings.craftingOrders.CRAFTINGORDERS_ORDER_CANCEL_RESPONSE(...)
+end
+--CRAFTINGORDERS_HIDE_CUSTOMER
 ns.events.eventFrame:RegisterUnitEvent("PLAYER_GUILD_UPDATE", "player")
 function ns.events.PLAYER_GUILD_UPDATE(unitId)
   local guildName, _, _, guildRealm = GetGuildInfo("player")
@@ -114,6 +182,11 @@ function ns.events.PLAYER_ENTERING_WORLD(...)
 
 end
 
+ns.events.eventFrame:RegisterEvent("UPDATE_INSTANCE_INFO")
+function ns.events.UPDATE_INSTANCE_INFO(...)
+  ns.CheckLockouts(...)
+end
+
 ns.events.eventFrame:RegisterEvent("WEEKLY_REWARDS_UPDATE")
 function ns.events.WEEKLY_REWARDS_UPDATE(...)
   ns.GreatVaultUpdate(...)
@@ -126,11 +199,17 @@ end
 ns.events.eventFrame:RegisterEvent("LOADING_SCREEN_DISABLED")
 function ns.events.LOADING_SCREEN_DISABLED()
     ns.InLoadingScreen = false
-    --dealAfterLoadingScreen()
+    private.dealAfterLoadingScreen()
 end
+
 ns.events.eventFrame:RegisterEvent("PLAYER_LEAVING_WORLD")
 function ns.events.PLAYER_LEAVING_WORLD(...)
   ns.database.SaveToCurrentCharacterDB(ns.enums.context.lastLogout, nil, GetServerTime())
+end
+
+ns.events.eventFrame:RegisterEvent("CHALLENGE_MODE_MAPS_UPDATE")
+function ns.events.CHALLENGE_MODE_MAPS_UPDATE(...)
+  ns.randomThings.dungeonsDone.CHALLENGE_MODE_MAPS_UPDATE(...)
 end
 
 ns.events.eventFrame:RegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")
@@ -144,6 +223,11 @@ function ns.events.ADDON_RESTRICTION_STATE_CHANGED(type, state)
   ns.Debug.print("ns.restrictedAddonMessages changed: '%s'", ns.restrictedAddonMessages)
 end
 
+ns.events.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+function ns.events.PLAYER_REGEN_ENABLED(...)
+  ns.items.PLAYER_REGEN_ENABLED(...)
+end
+
 do
   local whitelistedDifs = {
     [16] = true, -- Mythic
@@ -155,6 +239,7 @@ do
   function ns.events.ENCOUNTER_END(encounterID, encounterName, difficultyID, groupSize, success, npcs, ...)
     if not (whitelistedDifs[difficultyID] and success == 1) then return end
     ns.communication.SendInfoForLoot()
+    RequestRaidInfo() -- refresh lockouts
   end
 end
 

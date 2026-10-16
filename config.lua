@@ -17,7 +17,7 @@ ns.hasDataAddon = WowUtilsPublicDataAPI and true or false
 ns.config = {
   timestampOffset = 1767225600, -- 	01/01/26 00:00:00 UTC
   currentDBVersion = 3, -- 3: sim items are keyed itemId -> array of entries, so a sim can report the same item for more than one slot/source
-  configVersion = 5, -- 5: payloads are zlib wrapped now, pre-1.0.6 clients can't read them so let them ignore us outright
+  configVersion = 6, -- >= 5 - payloads are zlib wrapped
   droptimizerKeepTime = 14*24*60*60, -- 14 days. shared by the import and the cleanup sweep so the two can't fight over the same sims
   guiIlvlFilter = 250, -- roster "Hide Low ilvl characters" cutoff, compared against the median watermark
   watermarks = {
@@ -55,8 +55,55 @@ ns.config = {
     [96442] = {}, -- Seeking Knowledge Week 3 of 5: Ley Line Assaults
     [96443] = {}, -- Seeking Knowledge Week 4 of 5: Magical Primessence
     [96444] = {}, -- Seeking Knowledge Week 5 of 5: Off-World Magic
-  }
+  },
+  ---@type wowutils_config_lockouts
+  lockouts = { -- raid lockouts packed into a single number, a set bit means the boss is still available. bit order follows these tables, so any change needs a configVersion bump and version specific handling for older masks (R handler, full syncs, stored data)
+    difficulties = { -- 3 bits per boss, so 17 bosses max before going past 2^53
+      ns.enums.difficultyId.RaidNormal,
+      ns.enums.difficultyId.RaidHeroic,
+      ns.enums.difficultyId.RaidMythic, -- swapped to RaidMythicFlex for encounters tagged with mythicFlex
+    },
+    raids = {
+      { -- Tidebound Grotto
+        instanceId = 2987,
+        encounters = {
+          { id = 3379, mythicFlex = true }, -- Nymrissa Wavecaller
+        },
+      },
+      { -- The Venomous Abyss
+        instanceId = 3004,
+        encounters = {
+          { id = 3470 }, -- Nek'zali The Soulcoiler
+          { id = 3445 }, -- Entombed Sentinel
+          { id = 3497 }, -- The Lost Explorers
+          { id = 3455 }, -- Vashnik the Malignant
+          { id = 3420 }, -- Sszorak
+          { id = 3421 }, -- The Twin Fangs
+          { id = 3429 }, -- The Coiled Altar
+          { id = 3492 }, -- Ula'tek
+        },
+      },
+      { -- The Unbinding of Kith'ix
+        instanceId = 3095,
+        encounters = {
+          {id = 3513, mythicFlex = true} -- Kith'ix
+        },
+      },
+    },
+  },
 }
+
+---@class wowutils_config_lockouts
+---@field difficulties wowutils_enums_difficultyId[]
+---@field raids wowutils_config_lockoutRaid[]
+
+---@class wowutils_config_lockoutRaid
+---@field instanceId number
+---@field encounters wowutils_config_lockoutEncounter[]
+
+---@class wowutils_config_lockoutEncounter
+---@field id number dungeon encounter id (ENCOUNTER_END / C_RaidLocks), not the journal one
+---@field mythicFlex boolean? the mythic bit is checked against RaidMythicFlex instead of RaidMythic
 
 local guid = UnitGUID('player')
 

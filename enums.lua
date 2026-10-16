@@ -30,6 +30,10 @@ ns.enums = {
     generalUpdatedCheck = "generalUpdatedCheck",
     syncListRequest = "syncListRequest",
     bonusCoin = "bonusCoin",
+    itemCache = "itemCache",
+    craftingOrders = "craftingOrders",
+    lockouts = "lockouts",
+    dungeonsDone = "dungeonsDone",
   },
   ---@enum wowutils_enums_addonMessageTypes
   addonMessagesTypes = {
@@ -49,6 +53,8 @@ ns.enums = {
     fullSynclistInformation = "N",
     generalUpdatedCheck = "O",
     syncListRequest = "P",
+    itemCache = "Q",
+    craftingOrders = "R",
   },
   ---@class wowutils_enums_chatChannels
   chatChannels = {
@@ -97,5 +103,12 @@ ns.enums = {
     normal = 1,
     warning = 2,
     error = 3,
+  },
+  ---@enum wowutils_enums_itemCacheType
+  itemCacheType = {
+    equipped = "e",
+    bank = "bk",
+    bags = "bg",
+    warbank = "wb",
   },
 }

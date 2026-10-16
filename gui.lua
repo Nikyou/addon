@@ -105,6 +105,97 @@ local function CreateCheckbox(parent, text, onClick)
   return check
 end
 
+---Muted caption above an option control.
+---@param parent Frame
+---@param text string
+local function CreateOptionLabel(parent, text)
+  local label = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  label:SetText(text)
+  label:SetTextColor(unpack(COLORS.muted))
+  return label
+end
+
+---@param parent Frame
+---@param width number
+---@param minValue number
+---@param maxValue number
+---@param step number
+---@param value number
+---@param format fun(value: number): string
+---@param onChange fun(value: number)
+local function CreateSlider(parent, width, minValue, maxValue, step, value, format, onChange)
+  local slider = CreateFrame("Frame", nil, parent, "MinimalSliderWithSteppersTemplate")
+  slider:SetWidth(width)
+  local steps = floor((maxValue - minValue) / step + 0.5)
+  ---@diagnostic disable-next-line: param-type-mismatch
+  slider:Init(value, minValue, maxValue, steps, {
+    [MinimalSliderWithSteppersMixin.Label.Right] = CreateMinimalSliderFormatter(MinimalSliderWithSteppersMixin.Label.Right, format),
+  })
+  ---@diagnostic disable-next-line: param-type-mismatch
+  slider:RegisterCallback(MinimalSliderWithSteppersMixin.Event.OnValueChanged, function(_, newValue)
+    -- fractional steps drift (0.30000000000000004), snap back onto the step grid
+    onChange(floor(newValue / step + 0.5) * step)
+  end, slider)
+  return slider
+end
+
+---@param parent Frame
+---@param width number
+---@param options {text:string, value:any}[]|fun(): {text:string, value:any}[] function gets called every time the menu opens
+---@param getValue fun(): any
+---@param onSelect fun(value: any)
+---@param scrollHeight number? long lists scroll instead of running off screen
+local function CreateDropdown(parent, width, options, getValue, onSelect, scrollHeight)
+  local dropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
+  dropdown:SetWidth(width)
+  dropdown:SetupMenu(function(_, rootDescription)
+    if scrollHeight then
+      rootDescription:SetScrollMode(scrollHeight)
+    end
+    for _, option in ipairs(type(options) == "function" and options() or options) do
+      rootDescription:CreateRadio(option.text, function() return getValue() == option.value end, function() onSelect(option.value) end)
+    end
+  end)
+  return dropdown
+end
+
+---Small bordered square showing a color, opens the color picker on click.
+---@param parent Frame
+---@param color {r:number, g:number, b:number} edited in place
+---@param onChange fun()
+local function CreateColorSwatch(parent, color, onChange)
+  local swatch = CreateFrame("Button", nil, parent, "BackdropTemplate")
+  swatch:SetSize(40, 20)
+  ApplyFlatTheme(swatch, COLORS.button)
+  local fill = swatch:CreateTexture(nil, "ARTWORK")
+  fill:SetPoint("TOPLEFT", 2, -2)
+  fill:SetPoint("BOTTOMRIGHT", -2, 2)
+
+  local function setColor(r, g, b)
+    color.r, color.g, color.b = r, g, b
+    fill:SetColorTexture(r, g, b)
+    onChange()
+  end
+  fill:SetColorTexture(color.r, color.g, color.b)
+
+  swatch:SetScript("OnEnter", function(self) self:SetBackdropBorderColor(unpack(COLORS.accent)) end)
+  swatch:SetScript("OnLeave", function(self) self:SetBackdropBorderColor(unpack(COLORS.border)) end)
+  swatch:SetScript("OnClick", function()
+    local oldR, oldG, oldB = color.r, color.g, color.b
+    ColorPickerFrame:SetupColorPickerAndShow({
+      r = oldR, g = oldG, b = oldB,
+      hasOpacity = false,
+      swatchFunc = function()
+        setColor(ColorPickerFrame:GetColorRGB())
+      end,
+      cancelFunc = function()
+        setColor(oldR, oldG, oldB)
+      end,
+    })
+  end)
+  return swatch
+end
+
 ---Underline style tab, the active one gets an accent bar and brighter text.
 ---@param parent Frame
 ---@param text string
@@ -463,7 +554,7 @@ local function BuildDetailTextForCharacter(char)
   tinsert(lines, "Bonus coin usage: " .. ns.helpers.GetFormatedLastUpdateTime(char.bonusCoinUsageUpdated))
   if char.bonusCoinUsage and #char.bonusCoinUsage > 0 then
     for _, v in ipairs(char.bonusCoinUsage) do
-      tinsert(lines, pad(sformat("%s %s", v.itemLink, ns.helpers.GetFormatedLastUpdateTime(v.receiveTime))))
+      tinsert(lines, pad(sformat("%s %s %s", ns.helpers.GetIconTextureStringForSpecId(v.specId), v.itemLink, ns.helpers.GetFormatedLastUpdateTime(v.receiveTime))))
     end
   else
     tinsert(lines, pad("none"))
@@ -781,6 +872,279 @@ local function SetupList(parent, getEntries, onSelect)
   return Refresh
 end
 
+---Settings for the notification MessageFrame (notifications.lua), everything applies live.
+---@param parent Frame
+function GUI:CreateNotificationsOptions(parent)
+  local o = WowUtilsDB.options.notifications
+  local ROW = 48
+  local function apply()
+    ns.notifications.ApplySettings()
+  end
+  -- label above, control below, columns grow downwards
+  local columns = { { x = 12, y = -10 }, { x = 380, y = -10 } }
+  local function place(columnIndex, labelText, control, controlOffsetX)
+    local column = columns[columnIndex]
+    local label = CreateOptionLabel(parent, labelText)
+    label:SetPoint("TOPLEFT", parent, "TOPLEFT", column.x, column.y)
+    control:SetPoint("TOPLEFT", label, "BOTTOMLEFT", controlOffsetX or 0, -6)
+    column.y = column.y - ROW
+  end
+
+  -- left column
+  local unlock = CreateCheckbox(parent, "Unlock (drag to move)", function(checked)
+    ns.notifications.SetUnlocked(checked)
+  end)
+  unlock:SetPoint("TOPLEFT", parent, "TOPLEFT", columns[1].x - 4, columns[1].y)
+  columns[1].y = columns[1].y - 34
+  -- leaving it unlocked after closing the window would just leave a green box on screen
+  self.frame:HookScript("OnHide", function()
+    unlock:SetChecked(false)
+    ns.notifications.SetUnlocked(false)
+  end)
+
+  local test = CreateButton(parent, "Test", 60, 20)
+  test:SetPoint("LEFT", unlock.label, "RIGHT", 12, -1)
+  test:SetScript("OnClick", function()
+    ns.notifications.AddMessage("WowUtils test notification")
+  end)
+
+  -- built on open, other addons can keep registering fonts to LSM after we load
+  local function getFontOptions()
+    local fontOptions = {}
+    for _, name in ipairs(ns.notifications.LSM:List("font")) do
+      tinsert(fontOptions, { text = name, value = name })
+    end
+    return fontOptions
+  end
+  place(1, "Font", CreateDropdown(parent, 200, getFontOptions, function() return o.font end, function(value)
+    o.font = value
+    apply()
+  end, 400))
+
+  place(1, "Alignment", CreateDropdown(parent, 200, {
+    { text = "Left", value = "LEFT" },
+    { text = "Center", value = "CENTER" },
+    { text = "Right", value = "RIGHT" },
+  }, function() return o.justify end, function(value)
+    o.justify = value
+    apply()
+  end))
+  -- only affects new messages, ones already on screen keep their color
+  place(1, "Default text color", CreateColorSwatch(parent, o.color, function() end))
+
+  -- right column
+  local SLIDER_WIDTH = 250
+  local function formatNumber(value) return tostring(value) end
+  local function formatSeconds(value) return sformat("%.1fs", value) end
+
+  place(2, "Font size", CreateSlider(parent, SLIDER_WIDTH, 8, 40, 1, o.fontSize, formatNumber, function(value)
+    o.fontSize = value
+    apply()
+  end))
+
+  place(2, "Line spacing", CreateSlider(parent, SLIDER_WIDTH, -10, 20, 1, o.spacing, formatNumber, function(value)
+    o.spacing = value
+    apply()
+  end))
+
+  place(2, "Display time", CreateSlider(parent, SLIDER_WIDTH, 0.5, 10, 0.5, o.timeVisible, formatSeconds, function(value)
+    o.timeVisible = value
+    apply()
+  end))
+
+  place(2, "Fade duration", CreateSlider(parent, SLIDER_WIDTH, 0, 3, 0.1, o.fadeDuration, formatSeconds, function(value)
+    o.fadeDuration = value
+    apply()
+  end))
+
+  local maxX = floor(UIParent:GetWidth() / 2)
+  local maxY = floor(UIParent:GetHeight() / 2)
+  local xSlider = CreateSlider(parent, SLIDER_WIDTH, -maxX, maxX, 1, o.x, formatNumber, function(value)
+    o.x = value
+    apply()
+  end)
+  place(2, "X offset", xSlider)
+
+  local ySlider = CreateSlider(parent, SLIDER_WIDTH, -maxY, maxY, 1, o.y, formatNumber, function(value)
+    o.y = value
+    apply()
+  end)
+  place(2, "Y offset", ySlider)
+
+  -- dragging the frame moves it outside of the sliders, keep them in sync
+  ns.notifications.OnPositionChanged = function()
+    xSlider:SetValue(o.x)
+    ySlider:SetValue(o.y)
+  end
+end
+
+---Crafting order notification settings, the notification itself uses the frame from notifications.lua
+---@param parent Frame
+function GUI:CreateCraftingOrdersOptions(parent)
+  local o = WowUtilsDB.options.craftingOrders
+
+  local printToChat = CreateCheckbox(parent, "Print to chat", function(checked)
+    o.printToChat = checked
+  end)
+  printToChat:SetPoint("TOPLEFT", parent, "TOPLEFT", 8, -10)
+  printToChat:SetChecked(o.printToChat)
+
+  local test = CreateButton(parent, "Test", 60, 20)
+  test:SetPoint("LEFT", printToChat.label, "RIGHT", 12, -1)
+  test:SetScript("OnClick", function()
+    ns.randomThings.craftingOrders.ShowTestNotification()
+  end)
+
+  local thresholdLabel = CreateOptionLabel(parent, "Minimum tip")
+  thresholdLabel:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, -50)
+  local threshold = CreateSlider(parent, 250, 0, 5000, 1, o.tipThreshold, function(value) return sformat("%dg", value) end, function(value)
+    o.tipThreshold = value
+  end)
+  threshold:SetPoint("TOPLEFT", thresholdLabel, "BOTTOMLEFT", 0, -6)
+
+  local professionsLabel = CreateOptionLabel(parent, "Notify for")
+  professionsLabel:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, -110)
+  local previous
+  for _, profession in ipairs(ns.randomThings.craftingOrders.notifyProfessions) do
+    local professionId = profession.id
+    local toggle = CreateCheckbox(parent, profession.icon .. " " .. profession.name, function(checked)
+      o.professions[professionId] = checked or nil
+    end)
+    if previous then
+      toggle:SetPoint("TOPLEFT", previous, "BOTTOMLEFT", 0, -2)
+    else
+      toggle:SetPoint("TOPLEFT", professionsLabel, "BOTTOMLEFT", -4, -4)
+    end
+    toggle:SetChecked(o.professions[professionId] and true or false)
+    previous = toggle
+  end
+end
+
+StaticPopupDialogs["WOWUTILS_DELETE_SYNCLIST"] = {
+  text = "Delete sync list '%s'?\n\nGuild members who still have it can send it back.",
+  button1 = DELETE,
+  button2 = CANCEL,
+  OnAccept = function(_, listId)
+    WowUtilsDB.syncLists[listId] = nil
+    ns.database.CheckEligibleSyncLists()
+    if GUI.syncListsRefresh then
+      GUI.syncListsRefresh()
+    end
+  end,
+  timeout = 0,
+  whileDead = true,
+  hideOnEscape = true,
+  preferredIndex = 3,
+}
+
+local SYNCLIST_TOOLTIP_SLUGS = 20
+
+---Every sync list with its character count and last update, hover for the slugs, delete on the right.
+---@param parent Frame
+---@return fun() refresh
+function GUI:CreateSyncListsOptions(parent)
+  local rows = {}
+  local _, content = CreateListPanel(parent)
+
+  local empty = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  empty:SetPoint("TOPLEFT", parent, "TOPLEFT", 14, -14)
+  empty:SetTextColor(unpack(COLORS.muted))
+  empty:SetText("No sync lists")
+
+  local function ShowSlugs(row)
+    local list = WowUtilsDB.syncLists[row.listId]
+    if not list then return end
+    local slugs = {}
+    for _, slug in pairs(safeTable(list.characters)) do
+      tinsert(slugs, tostring(slug))
+    end
+    table.sort(slugs)
+    GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+    GameTooltip:SetText(row.listId, 1, 1, 1)
+    local muted = COLORS.muted
+    for i = 1, math.min(#slugs, SYNCLIST_TOOLTIP_SLUGS) do
+      GameTooltip:AddLine(slugs[i], muted[1], muted[2], muted[3])
+    end
+    if #slugs > SYNCLIST_TOOLTIP_SLUGS then
+      GameTooltip:AddLine(sformat("+%d more", #slugs - SYNCLIST_TOOLTIP_SLUGS), muted[1], muted[2], muted[3])
+    elseif #slugs == 0 then
+      GameTooltip:AddLine("No characters", muted[1], muted[2], muted[3])
+    end
+    GameTooltip:Show()
+  end
+
+  local function Refresh()
+    local listIds = {}
+    for listId in pairs(WowUtilsDB.syncLists) do
+      tinsert(listIds, listId)
+    end
+    table.sort(listIds, function(a, b) return tostring(a) < tostring(b) end)
+
+    for _, row in ipairs(rows) do
+      row:Hide()
+    end
+    empty:SetShown(#listIds == 0)
+
+    for i, listId in ipairs(listIds) do
+      local row = rows[i]
+      if not row then
+        row = CreateFrame("Frame", nil, content, "BackdropTemplate")
+        row:SetHeight(ROW_HEIGHT)
+        row:SetPoint("LEFT", content, "LEFT", 4, 0)
+        row:SetPoint("RIGHT", content, "RIGHT", -4, 0)
+        ApplyFlatTheme(row, COLORS.row, COLORS.border)
+        row:EnableMouse(true)
+
+        row.accent = row:CreateTexture(nil, "ARTWORK")
+        row.accent:SetPoint("TOPLEFT", row, "TOPLEFT", 1, -1)
+        row.accent:SetPoint("BOTTOMLEFT", row, "BOTTOMLEFT", 1, 1)
+        row.accent:SetWidth(3)
+
+        row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.name:SetPoint("LEFT", row, "LEFT", 12, 0)
+        row.name:SetJustifyH("LEFT")
+
+        row.delete = CreateButton(row, DELETE, 60, 20)
+        row.delete:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+        row.delete:SetScript("OnClick", function()
+          StaticPopup_Show("WOWUTILS_DELETE_SYNCLIST", tostring(row.listId), nil, row.listId)
+        end)
+
+        row.info = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.info:SetPoint("RIGHT", row.delete, "LEFT", -10, 0)
+        row.info:SetPoint("LEFT", row.name, "RIGHT", 10, 0)
+        row.info:SetJustifyH("RIGHT")
+        row.info:SetTextColor(unpack(COLORS.muted))
+
+        row:SetScript("OnEnter", function(self)
+          self:SetBackdropColor(unpack(COLORS.rowHover))
+          ShowSlugs(self)
+        end)
+        row:SetScript("OnLeave", function(self)
+          self:SetBackdropColor(unpack(self.baseColor or COLORS.row))
+          GameTooltip_Hide()
+        end)
+
+        rows[i] = row
+      end
+
+      local list = WowUtilsDB.syncLists[listId]
+      row.listId = listId
+      row:SetPoint("TOP", content, "TOP", 0, -(i - 1) * (ROW_HEIGHT + ROW_SPACING) - 4)
+      row:Show()
+      row.name:SetText(tostring(listId))
+      local count = CountTable(safeTable(list.characters))
+      row.info:SetText(sformat("%d character%s   %s", count, count == 1 and "" or "s",
+        ns.helpers.GetFormatedLastUpdateTime(list.lastUpdate or 0)))
+      ApplyRowStyle(row, nil, i)
+    end
+
+    content:SetHeight(math.max(1, #listIds * (ROW_HEIGHT + ROW_SPACING) + 8))
+  end
+
+  return Refresh
+end
+
 function GUI:Create()
   if self.frame then
     return
@@ -858,19 +1222,43 @@ function GUI:Create()
   tabLine:SetPoint("BOTTOMRIGHT", tabHolder, "BOTTOMRIGHT", 0, 0)
   tabLine:SetHeight(1)
 
-  local rosterBtn = CreateTab(tabHolder, "Roster")
-  rosterBtn:SetPoint("BOTTOMLEFT", tabHolder, "BOTTOMLEFT", 0, 0)
-  rosterBtn:SetScript("OnClick", function()
+  local generalBtn = CreateTab(tabHolder, "General")
+  generalBtn:SetPoint("BOTTOMLEFT", tabHolder, "BOTTOMLEFT", 0, 0)
+  generalBtn:SetScript("OnClick", function()
     self:SetTab(1)
+  end)
+
+  local rosterBtn = CreateTab(tabHolder, "Roster")
+  rosterBtn:SetPoint("BOTTOMLEFT", generalBtn, "BOTTOMRIGHT", 4, 0)
+  rosterBtn:SetScript("OnClick", function()
+    self:SetTab(2)
   end)
 
   local droptimizerBtn = CreateTab(tabHolder, "Droptimizer")
   droptimizerBtn:SetPoint("BOTTOMLEFT", rosterBtn, "BOTTOMRIGHT", 4, 0)
   droptimizerBtn:SetScript("OnClick", function()
-    self:SetTab(2)
+    self:SetTab(3)
   end)
 
-  self.tabButtons = { rosterBtn, droptimizerBtn }
+  local notificationsBtn = CreateTab(tabHolder, "Notifications")
+  notificationsBtn:SetPoint("BOTTOMLEFT", droptimizerBtn, "BOTTOMRIGHT", 4, 0)
+  notificationsBtn:SetScript("OnClick", function()
+    self:SetTab(4)
+  end)
+
+  local craftingOrdersBtn = CreateTab(tabHolder, "Crafting Orders")
+  craftingOrdersBtn:SetPoint("BOTTOMLEFT", notificationsBtn, "BOTTOMRIGHT", 4, 0)
+  craftingOrdersBtn:SetScript("OnClick", function()
+    self:SetTab(5)
+  end)
+
+  local syncListsBtn = CreateTab(tabHolder, "Sync Lists")
+  syncListsBtn:SetPoint("BOTTOMLEFT", craftingOrdersBtn, "BOTTOMRIGHT", 4, 0)
+  syncListsBtn:SetScript("OnClick", function()
+    self:SetTab(6)
+  end)
+
+  self.tabButtons = { generalBtn, rosterBtn, droptimizerBtn, notificationsBtn, craftingOrdersBtn, syncListsBtn }
 
   local panel = CreateFrame("Frame", nil, frame, "BackdropTemplate")
   panel:SetPoint("TOPLEFT", tabHolder, "BOTTOMLEFT", 0, -8)
@@ -879,16 +1267,71 @@ function GUI:Create()
 
   self.panel = panel
 
+  local generalPanel = CreateFrame("Frame", nil, panel)
+  generalPanel:SetAllPoints(panel)
+  generalPanel:Hide()
+
   local rosterPanel = CreateFrame("Frame", nil, panel)
   rosterPanel:SetAllPoints(panel)
-  rosterPanel:Show()
+  rosterPanel:Hide()
 
   local droptimizerPanel = CreateFrame("Frame", nil, panel)
   droptimizerPanel:SetAllPoints(panel)
   droptimizerPanel:Hide()
 
+  local notificationsPanel = CreateFrame("Frame", nil, panel)
+  notificationsPanel:SetAllPoints(panel)
+  notificationsPanel:Hide()
+  self:CreateNotificationsOptions(notificationsPanel)
+
+  local craftingOrdersPanel = CreateFrame("Frame", nil, panel)
+  craftingOrdersPanel:SetAllPoints(panel)
+  craftingOrdersPanel:Hide()
+  self:CreateCraftingOrdersOptions(craftingOrdersPanel)
+
+  local syncListsPanel = CreateFrame("Frame", nil, panel)
+  syncListsPanel:SetAllPoints(panel)
+  syncListsPanel:Hide()
+  self.syncListsRefresh = self:CreateSyncListsOptions(syncListsPanel)
+
+  self.generalPanel = generalPanel
   self.rosterPanel = rosterPanel
   self.droptimizerPanel = droptimizerPanel
+  self.notificationsPanel = notificationsPanel
+
+  local warboundOptions = WowUtilsDB.options.warboundOptions
+
+  local warboundSelfOnly
+  local function UpdateWarboundSelfOnlyState()
+    warboundSelfOnly:SetEnabled(warboundOptions.enabled)
+    warboundSelfOnly.label:SetAlpha(warboundOptions.enabled and 1 or 0.4)
+  end
+
+  local warboundEnabled = CreateCheckbox(generalPanel, "Show warbound drops", function(checked)
+    warboundOptions.enabled = checked
+    if checked then
+      ns.events.RegisterEvent("CHAT_MSG_LOOT")
+    else
+      ns.events.UnregisterEvent("CHAT_MSG_LOOT")
+    end
+    UpdateWarboundSelfOnlyState()
+  end)
+  warboundEnabled:SetPoint("TOPLEFT", generalPanel, "TOPLEFT", 10, -6)
+  warboundEnabled:SetChecked(warboundOptions.enabled)
+  warboundEnabled:HookScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Show warbound drops", 1, 1, 1)
+    GameTooltip:AddLine("Tracks looted warbound items by parsing the chat. (Shows them in notifications)", nil, nil, nil, true)
+    GameTooltip:Show()
+  end)
+  warboundEnabled:HookScript("OnLeave", GameTooltip_Hide)
+
+  warboundSelfOnly = CreateCheckbox(generalPanel, "Own only", function(checked)
+    warboundOptions.selfOnly = checked
+  end)
+  warboundSelfOnly:SetPoint("TOPLEFT", warboundEnabled, "BOTTOMLEFT", 18, -2)
+  warboundSelfOnly:SetChecked(warboundOptions.selfOnly)
+  UpdateWarboundSelfOnlyState()
 
   -- these only apply to the roster, so the bar lives inside that panel instead of the window header
   local filterBar = CreateFrame("Frame", nil, rosterPanel)
@@ -936,24 +1379,33 @@ function GUI:Create()
   self.rosterRefresh = rosterRefresh
   self.droptimizerRefresh = droptimizerRefresh
 
+  -- same order as tabButtons, refresh is optional for tabs without list data
+  self.tabs = {
+    { panel = generalPanel },
+    { panel = rosterPanel, refresh = rosterRefresh },
+    { panel = droptimizerPanel, refresh = droptimizerRefresh },
+    { panel = notificationsPanel },
+    { panel = craftingOrdersPanel },
+    { panel = syncListsPanel, refresh = self.syncListsRefresh },
+  }
+
   self:SetTab(1)
 end
 
 function GUI:SetTab(index)
   self:Create()
 
-  if index == 2 then
-    self.activeTab = 2
-    self.rosterPanel:Hide()
-    self.droptimizerPanel:Show()
-    self.panel:Show()
-    self.droptimizerRefresh()
-  else
-    self.activeTab = 1
-    self.droptimizerPanel:Hide()
-    self.rosterPanel:Show()
-    self.panel:Show()
-    self.rosterRefresh()
+  if not self.tabs[index] then
+    index = 1
+  end
+  self.activeTab = index
+
+  for i, tab in ipairs(self.tabs) do
+    tab.panel:SetShown(i == index)
+  end
+  self.panel:Show()
+  if self.tabs[index].refresh then
+    self.tabs[index].refresh()
   end
 
   for i, btn in ipairs(self.tabButtons) do

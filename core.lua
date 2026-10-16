@@ -1,6 +1,8 @@
 ---@class wowutilsPrivate : table
 ---@field GreatVaultUpdate fun(...)
 ---@field CheckQuests fun(...)
+---@field CheckLockouts fun(...)
+---@field lockouts wowutils_lockouts
 
 ---@type string, wowutilsPrivate
 local addon_name, ns = ...
@@ -116,4 +118,75 @@ function ns.CheckQuests(...)
     }
   end
   ns.database.SaveToCurrentCharacterDB(ns.enums.context.quests, nil, t)
+end
+
+do -- Raid lockouts
+  -- one bit per boss per difficulty, bosses in config order, difficulties in config order within a boss.
+  -- plain arithmetic instead of bit.*, those are 32 bit only while doubles stay exact up to 2^53
+  local config = ns.config.lockouts
+  local difsPerBoss = #config.difficulties
+  local bossCount = 0
+  for _, raid in ipairs(config.raids) do
+    bossCount = bossCount + #raid.encounters
+  end
+  local bitCount = bossCount * difsPerBoss
+  assert(bitCount <= 53, "ns.config.lockouts has too many bosses to fit into a single number")
+
+  ---@class wowutils_lockouts
+  ns.lockouts = {
+    bitCount = bitCount,
+    fullMask = 2^bitCount - 1, -- every boss available, what a fresh week looks like
+  }
+
+  ---@param encounter wowutils_config_lockoutEncounter
+  ---@param difId wowutils_enums_difficultyId
+  ---@return wowutils_enums_difficultyId
+  local function getRealDifficulty(encounter, difId)
+    if encounter.mythicFlex and difId == ns.enums.difficultyId.RaidMythic then
+      return ns.enums.difficultyId.RaidMythicFlex
+    end
+    return difId
+  end
+
+  ---@param value number
+  ---@param bit number 0 based
+  ---@return boolean
+  function ns.lockouts.IsBitSet(value, bit)
+    local b = 2^bit
+    return value % (b * 2) >= b
+  end
+
+  ---@param value number lockout mask
+  ---@return table<number, table<number, boolean>> available encounterId = { difficultyId = available }, mythic flex encounters are keyed under RaidMythicFlex
+  function ns.lockouts.Decode(value)
+    local t = {}
+    local bit = 0
+    for _, raid in ipairs(config.raids) do
+      for _, encounter in ipairs(raid.encounters) do
+        t[encounter.id] = {}
+        for _, difId in ipairs(config.difficulties) do
+          t[encounter.id][getRealDifficulty(encounter, difId)] = ns.lockouts.IsBitSet(value, bit)
+          bit = bit + 1
+        end
+      end
+    end
+    return t
+  end
+
+  -- only call from UPDATE_INSTANCE_INFO, before the first one C_RaidLocks has nothing and everything would read as available
+  function ns.CheckLockouts()
+    local value = 0
+    local bit = 0
+    for _, raid in ipairs(config.raids) do
+      for _, encounter in ipairs(raid.encounters) do
+        for _, difId in ipairs(config.difficulties) do
+          if not C_RaidLocks.IsEncounterComplete(raid.instanceId, encounter.id, getRealDifficulty(encounter, difId)) then
+            value = value + 2^bit
+          end
+          bit = bit + 1
+        end
+      end
+    end
+    ns.database.SaveToCurrentCharacterDB(ns.enums.context.lockouts, nil, value)
+  end
 end

@@ -26,9 +26,17 @@ function ns.rclc.OnLootTableReceived()
   ns.communication.SendInfoForLoot()
 end
 
-function ns.rclc.DataUpdated()
-  if not ns.rclc.votingWindow then return end
-  ns.rclc.votingWindow:Update()
+do
+  -- several droptimizer messages tend to arrive back to back after a loot table goes out, refresh once for all of them
+  local queued = false
+  function ns.rclc.DataUpdated()
+    if not ns.rclc.votingWindow or queued then return end
+    queued = true
+    C_Timer.After(0.5, function()
+      queued = false
+      if ns.rclc.votingWindow then ns.rclc.votingWindow:Update() end
+    end)
+  end
 end
 
 do
@@ -207,8 +215,9 @@ do
           local entry = bestEntryFor(entriesForViewedItem(simData, itemInfo), itemInfo.itemTrack, simData.simType)
           if entry then
             if simData.simType == ns.enums.simTypes.raidbotDroptimizer then
-              local dif = ((entry.gain or 0)/(simData.baseline or 1)) * 100
-              local val = sformat("%s (%.2f%%)", entry.gain or 0, dif)
+              -- no usable baseline, show the gain alone like the card does
+              local dif = (simData.baseline or 0) ~= 0 and ((entry.gain or 0) / simData.baseline) * 100 or nil
+              local val = dif and sformat("%s (%.2f%%)", entry.gain or 0, dif) or tostring(entry.gain or 0)
               if simKey:lower():match(raidbotsMatchStr) then -- patchwork 1 target sim, not gonna find a better match (?) TODO maybe figure out something better, in theory there could be multiple
                 return val, getSimLineColor(dif)
               end
@@ -305,6 +314,9 @@ do
       local pct = itemData.gainPercent or 0
       return "", sformat("%+.2f%%", pct), pct
     end
+    if simData.baseline == 0 then -- broken raidbots baseline, keep the gain but don't divide by it
+      return sformat("%+.0f", itemData.gain or 0), "", 0
+    end
     local pct = ((itemData.gain or 0) / simData.baseline) * 100
     return sformat("%+.0f", itemData.gain or 0), sformat("%+.2f%%", pct), pct
   end
@@ -371,7 +383,7 @@ do
     if not classFile and droptimizerData and droptimizerData.class and droptimizerData.class > 0 then
       classFile = select(2, GetClassInfo(droptimizerData.class))
     end
-    local _, _, _, equipLoc, icon = GetItemInfoInstant(itemInfo.itemLink)
+    local _, _, _, equipLoc, icon = C_Item.GetItemInfoInstant(itemInfo.itemLink)
     local ilvl = C_Item.GetDetailedItemLevelInfo(itemInfo.itemLink)
     local subtitle = {}
     if equipLoc and _G[equipLoc] then tinsert(subtitle, _G[equipLoc]) end
@@ -459,11 +471,13 @@ do
                 -- what the looted item turns into is a result *of* that item, not an alternative
                 -- to it: a token becoming a piece, or a base item the catalyst converts
                 local converts = convertsFrom(itemData, itemInfo.itemId)
-                local sameSlot = isMatchingSlot(itemInfo.invSlotId, itemData.equipmentSlot)
-                if converts or sameSlot then
+                -- the item's own results always count, its sim slot can differ from the looted one
+                -- (one-hander simmed into the off hand, slot names the import didn't know)
+                local own = itemId == itemInfo.itemId
+                if converts or own or isMatchingSlot(itemInfo.invSlotId, itemData.equipmentSlot) then
                   if not source then source, profile, targets = parseSimKey(simKey) end
                   local gainText, pctText, pct = formatGain(simData, itemData)
-                  if converts or itemId == itemInfo.itemId then
+                  if converts or own then
                     if not converts then plainRows = plainRows + 1 end
                     tinsert(rows, {
                       row = {
@@ -552,6 +566,28 @@ do
     if not playerData then
       m.noPlayerData = true
       return m
+    end
+
+    -- bonus coins used on the boss the item drops from, at the item's difficulty. a token or anything
+    -- else without a track can't tell its difficulty, so those list every difficulty instead
+    local encounterId = ns.items.GetItemEncounterId(itemInfo.itemId)
+    if encounterId then
+      local anyDif = itemInfo.itemTrack == ns.enums.itemTrack.none
+      m.bonusCoin = { encounterName = EJ_GetEncounterInfo(encounterId) or UNKNOWN, coins = {} }
+      m.bonusCoinUpdated = playerData.bonusCoinUsageUpdated
+      local coinCurrency = currencyData.bonusCoin and C_CurrencyInfo.GetCurrencyInfo(currencyData.bonusCoin.currencyId)
+      for _, usage in ipairs(playerData.bonusCoinUsage or {}) do
+        if usage.encounterId == encounterId and (anyDif or isCorrectDif(usage.difId, itemInfo.itemTrack)) then
+          local gotItem = usage.itemLink ~= "" and usage.itemLink or nil
+          tinsert(m.bonusCoin.coins, {
+            difficulty = anyDif and GetDifficultyInfo(usage.difId) or nil,
+            receiveTime = usage.receiveTime,
+            itemLink = gotItem,
+            -- what the roll gave, the coin itself when it gave nothing we have a link for
+            icon = gotItem and select(5, C_Item.GetItemInfoInstant(gotItem)) or coinCurrency and coinCurrency.iconFileID or 134400,
+          })
+        end
+      end
     end
 
     m.crestsUpdated = playerData.dataRefreshTimes and playerData.dataRefreshTimes.currency or playerData.currencyUpdated
@@ -649,17 +685,6 @@ function rclcMod:OnDisable()
   self:UnhookAll()
   self:UnregisterAllEvents()
 end
---[[
-function rclcMod:UpdateColumn(name, add)
-  ns.Debug.print("rclcMod:UpdateColumn(name, add)")
-end
---]]
---[[
-function rclcMod:SetupColumns()
-  ns.Debug.print("rclcMod:SetupColumns()")
-  self:UpdateVotingFrameColumns()
-end
---]]
 function rclcMod:UpdateSortNext()
   local cols = ns.rclc.votingWindow.scrollCols
   for i in ipairs(cols) do
@@ -741,36 +766,6 @@ function rclcMod.UpdateMainModCell(rowFrame, frame, data, cols, row, realrow, co
   local name = data[realrow].name
   local guid, droptimizerKey = getRowKeys(name)
   attachRowTooltip(frame, name, guid, droptimizerKey)
-  --[[
-  local f = frame.wowutilsButton
-  if not f then
-    f = CreateFrame("Button", nil, frame)
-    f:SetSize(table.rowHeight, table.rowHeight)
-    ns.Debug.print(f:GetWidth(), f:GetHeight())
-    f:SetPoint("CENTER", frame, "CENTER")
-    f.icon = f:CreateTexture(nil, "ARTWORK")
-    f.icon:SetSize(table.rowHeight-2, table.rowHeight-2)
-    f.icon:SetPoint("RIGHT", f, "RIGHT", -2, 0)
-    f.icon:SetTexture(ns.logoFile)
-    --f.text = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    --f.text:SetPoint("LEFT", f.icon, "LEFT", -2, 0)
-    --f.text:SetText("+123465")
-    f:SetScript("OnEnter", function(self)
-      local txt = ns.rclc.GetDataLinesForGuid(guid)
-      GameTooltip:SetOwner(self, "ANCHOR_CURSOR_RIGHT")
-      GameTooltip:AddLine(name)
-      GameTooltip:AddLine(txt)
-      GameTooltip:Show()
-    end)
-    f:SetScript("OnLeave", function()
-      GameTooltip:Hide()
-    end)
-    f:SetScript("OnClick", function()
-      ns.Debug.print("OnClick")
-    end)
-    frame.wowutilsButton = f
-  end
-  --]]
   local text, color = private.findSimValueForWindow(droptimizerKey)
   frame.text:SetText(text or "---")
   frame.text:SetTextColor(unpack(color or {1,1,1}))
@@ -815,11 +810,6 @@ function lootPopup.HandleEntry(entry)
       ns.rclc.ShowCandidateCard(self, ns.me.guid, ns.me.droptimizerKey, ns.me.name, entry.item)
     end)
     b:SetScript("OnLeave", ns.tooltip.Hide)
-    --[[
-    b:SetScript("OnClick", function()
-      ns.Debug.print("OnClick")
-    end)
-    --]]
     b.previewText = b:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     b.previewText:SetPoint("TOPRIGHT", b, "BOTTOMRIGHT", 0, -5)
     b.previewText:SetJustifyH("RIGHT")
